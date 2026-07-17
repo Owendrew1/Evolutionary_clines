@@ -1,0 +1,9 @@
+.mplcache/
+__pycache__/
+*.pyc
+.DS_Store
+fake_server/
+selected/
+# Uncomment to keep generated artifacts out of version control:
+# outputs/
+# data/
