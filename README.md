@@ -155,13 +155,17 @@ outputs/
 │   ├── summary_by_regime_class_labeled.csv  # + human-readable class names
 │   ├── summary_by_regime_class_column.csv   # per-column detail
 │   └── summary_by_regime_generation.csv     # slope stability over time
-└── figures/
-    ├── slope_distribution_by_regime.png     # is signal steeper at low migration?
-    ├── slope_distribution_by_class.png      # do classes differ?
-    ├── mean_slope_over_generation.png       # is the cline stable over time?
-    ├── meanpheno_<regime>_<class>_<col>.png # mean phenotype ± SD vs pop_id
-    └── lines_<regime>_<class>_<col>.png     # phenotype vs pop_id, several generations
+└── figures/                                 # 21 total: 3 regimes x 7 epistasis classes
+    ├── mig0/     cline_mig0_RE.png  cline_mig0_DE.png  ... (7 classes)
+    ├── mig0.01/  cline_mig0.01_RE.png  ...
+    └── mig0.05/  cline_mig0.05_RE.png  ...
 ```
+
+Each `cline_<regime>_<class>.png` pools all 10 selected files for that regime and
+shows, for one epistasis class: every column of the class as a faint line, the
+pooled mean ± SD per `pop_id`, and a bold OLS fit line with the **slope, R², n,
+and p-value** annotated. That one figure is the slope of that epistasis in that
+migration regime — 21 in total.
 
 Each summary table carries these metrics (per group):
 
@@ -185,8 +189,8 @@ expectations.
 - **Migration ordering holds**: `mean_abs_slope` and `mean_r2` **decrease** from
   `mig0` → `mig0.01` → `mig0.05`. Lower migration = stronger, tighter cline.
   This is the single most important sanity check.
-- **`mean_phenotype vs pop_id` looks smooth/monotone**, not jagged noise, in the
-  `meanpheno_*` figures — especially for `mig0`.
+- **The `cline_*` figures look smooth/monotone**, with the bold OLS line tracking
+  the pooled points rather than cutting through noise — especially for `mig0`.
 - **Classes differ sensibly**: e.g. inhibitory (`DI`) and negative (`NE`) classes
   show negative slopes; positive/recessive show positive; magnitudes differ but
   are stable within a class.
@@ -204,15 +208,15 @@ expectations.
 
 ### The bottom line for a short paper
 
-You have a defensible short paper if, across the first 5 files per regime:
+You have a defensible short paper if, across the 10 sampled files per regime:
 
 1. the migration ordering holds (steeper/tighter cline at lower migration),
 2. slope direction is consistent within class/regime, and
 3. at least a few epistasis classes show a clear, smooth cline at `mig0`.
 
-If those hold, expand to all files (`--n-files -1`) and the same three figures
-(`slope_distribution_by_regime`, `slope_distribution_by_class`,
-`meanpheno_*`) become your core paper figures.
+If those hold, the `cline_*` figures (compare the same class across the three
+regime folders) plus `summary_by_regime_class_labeled.csv` become your core
+paper material.
 
 ---
 

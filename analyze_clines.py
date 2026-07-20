@@ -90,8 +90,12 @@ COL_GENERATION = "generation"
 COL_POP_ID = "pop_id"
 COL_POP_SIZE = "pop_size"
 
-# Substrings that mark additive-dosage columns to ignore in the main analysis.
-ADDITIVE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [r"add", r"dosage", r"dose"]]
+# Columns to ignore in the phenotype slope analysis (additive dosages, allele
+# freqs, metadata). Real files use ADD_d0..ADD_d4 and freq_domA/freq_domB.
+SKIP_COLUMN_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in [r"^ADD_", r"add", r"dosage", r"dose", r"^freq_", r"^max_mig", r"^replicate$", r"^pop_max$", r"^pop_min$"]
+]
 
 
 @dataclass
@@ -134,21 +138,22 @@ def load_file(path: Path) -> pd.DataFrame:
 # Column identification
 # ---------------------------------------------------------------------------
 
-def is_additive_column(name: str) -> bool:
-    return any(p.search(name) for p in ADDITIVE_PATTERNS)
+def should_skip_column(name: str) -> bool:
+    return any(p.search(name) for p in SKIP_COLUMN_PATTERNS)
 
 
 def classify_epistasis_column(name: str) -> Optional[str]:
     """Return the epistasis class prefix a column belongs to, or None.
 
-    Matching is longest-prefix-first and boundary-aware so "DE" never claims a
-    "DDE_*"/"DRE_*" column.
+    Real SEC columns look like RE_pheno1, DDE_pheno2. Matching is
+    longest-prefix-first so "DE" never claims "DDE_*"/"DRE_*".
     """
-    if is_additive_column(name):
+    if should_skip_column(name):
         return None
     # Longest prefixes first (DRE, DDE before DE/DI/RE).
     for prefix in sorted(EPISTASIS_PREFIXES, key=len, reverse=True):
-        if re.match(rf"^{prefix}(_|\d|$)", name):
+        # RE_pheno1, RE_1, or bare RE
+        if re.match(rf"^{prefix}(_pheno|_|\d|$)", name, re.IGNORECASE):
             return prefix
     return None
 
@@ -333,113 +338,53 @@ def _regime_sort_key(r: str) -> float:
     return float(m.group(1)) if m else 0.0
 
 
-def plot_slope_by_regime(slope_df: pd.DataFrame, out_path: Path) -> None:
-    """Box/strip of per-generation slopes, one box per migration regime."""
-    order = [r for r in sorted(slope_df["regime"].unique(), key=_regime_sort_key)]
-    fig, ax = plt.subplots(figsize=(8, 6))
-    data = [slope_df.loc[slope_df["regime"] == r, "slope"].to_numpy() for r in order]
-    try:  # matplotlib >= 3.9 renamed labels -> tick_labels
-        ax.boxplot(data, tick_labels=order, showfliers=False)
-    except TypeError:
-        ax.boxplot(data, labels=order, showfliers=False)
-    for i, d in enumerate(data, start=1):
-        jitter = np.random.uniform(-0.12, 0.12, size=len(d))
-        ax.scatter(np.full_like(d, i) + jitter, d, s=8, alpha=0.4, color="steelblue")
-    ax.axhline(0, color="0.5", lw=1, ls="--")
-    ax.set_xlabel("Migration regime")
-    ax.set_ylabel("Slope (phenotype vs pop_id)")
-    ax.set_title("Slope distribution by migration regime")
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def plot_slope_by_class(slope_df: pd.DataFrame, out_path: Path) -> None:
-    """Box of slopes grouped by epistasis class, coloured/faceted by regime."""
-    classes = sorted(slope_df["epistasis_class"].dropna().unique())
-    regimes = [r for r in sorted(slope_df["regime"].unique(), key=_regime_sort_key)]
-    fig, ax = plt.subplots(figsize=(max(10, 1.6 * len(classes)), 6))
-    width = 0.8 / max(len(regimes), 1)
-    colors = plt.cm.viridis(np.linspace(0.15, 0.85, len(regimes)))
-    for j, reg in enumerate(regimes):
-        positions, data = [], []
-        for i, cls in enumerate(classes):
-            vals = slope_df[(slope_df["regime"] == reg) & (slope_df["epistasis_class"] == cls)]["slope"]
-            positions.append(i + j * width)
-            data.append(vals.to_numpy())
-        bp = ax.boxplot(data, positions=positions, widths=width * 0.9, patch_artist=True, showfliers=False)
-        for patch in bp["boxes"]:
-            patch.set_facecolor(colors[j])
-            patch.set_alpha(0.7)
-        ax.plot([], [], color=colors[j], label=reg, lw=6)
-    ax.axhline(0, color="0.5", lw=1, ls="--")
-    ax.set_xticks([i + width * (len(regimes) - 1) / 2 for i in range(len(classes))])
-    ax.set_xticklabels(classes)
-    ax.set_xlabel("Epistasis class")
-    ax.set_ylabel("Slope (phenotype vs pop_id)")
-    ax.set_title("Slope distribution by epistasis class and migration regime")
-    ax.legend(title="Regime", fontsize=9)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def plot_mean_phenotype_vs_popid(
-    df: pd.DataFrame, pheno_col: str, title: str, out_path: Path
+def plot_class_cline(
+    regime: str, cls: str, long_df: pd.DataFrame, out_path: Path
 ) -> None:
-    """Mean phenotype (+/- SD across generations) vs pop_id for one file/column."""
-    sub = df[[COL_POP_ID, pheno_col]].apply(pd.to_numeric, errors="coerce").dropna()
-    agg = sub.groupby(COL_POP_ID)[pheno_col].agg(["mean", "std"]).reset_index()
+    """One figure per (migration regime x epistasis class).
+
+    Pools all selected files, all generations, and ALL columns of the class,
+    then shows phenotype vs pop_id and the fitted clinal slope:
+      - each column of the class as a faint mean line (columns "put together"),
+      - the pooled points summarized as mean +/- SD per pop_id,
+      - a bold OLS fit line whose slope/R^2 are annotated.
+    """
     fig, ax = plt.subplots(figsize=(8, 6))
-    ax.errorbar(agg[COL_POP_ID], agg["mean"], yerr=agg["std"], fmt="o-", capsize=3, color="darkorange")
+
+    # Faint per-column mean lines so every column of the class is visible.
+    cols = sorted(long_df["column"].unique())
+    palette = plt.cm.tab10(np.linspace(0, 1, max(len(cols), 1)))
+    for color, col in zip(palette, cols):
+        cdf = long_df[long_df["column"] == col]
+        line = cdf.groupby(COL_POP_ID)["value"].mean().reset_index()
+        ax.plot(line[COL_POP_ID], line["value"], "-", lw=1, alpha=0.5,
+                color=color, label=col)
+
+    # Pooled mean +/- SD per pop_id (the summary cloud).
+    summ = long_df.groupby(COL_POP_ID)["value"].agg(["mean", "std"]).reset_index()
+    ax.errorbar(summ[COL_POP_ID], summ["mean"], yerr=summ["std"], fmt="o",
+                ms=4, capsize=3, color="0.25", alpha=0.8, zorder=4,
+                label="pooled mean +/- SD")
+
+    # Bold OLS fit through ALL pooled points -> the clinal slope.
+    x = long_df[COL_POP_ID].to_numpy(dtype=float)
+    y = long_df["value"].to_numpy(dtype=float)
+    fit = _ols_slope(x, y)
+    if fit is not None:
+        xs = np.array([np.nanmin(x), np.nanmax(x)])
+        ys = fit["intercept"] + fit["slope"] * xs
+        ax.plot(xs, ys, "-", color="crimson", lw=3, zorder=5,
+                label=f"OLS fit (slope={fit['slope']:.3g})")
+        ax.text(0.02, 0.98,
+                f"slope = {fit['slope']:.3g}\nR^2 = {fit['r2']:.2f}\n"
+                f"n = {fit['n_points']}  (p = {fit['p_value']:.1e})",
+                transform=ax.transAxes, va="top", ha="left", fontsize=10,
+                bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.9))
+
     ax.set_xlabel("pop_id (spatial position)")
-    ax.set_ylabel(f"Mean {pheno_col}")
-    ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def plot_lines_by_generation(
-    df: pd.DataFrame, pheno_col: str, title: str, out_path: Path, max_gens: int = 6
-) -> None:
-    """Phenotype vs pop_id, one line per (subset of) generations."""
-    if COL_GENERATION not in df.columns:
-        return
-    gens = sorted(pd.to_numeric(df[COL_GENERATION], errors="coerce").dropna().unique())
-    if len(gens) > max_gens:
-        idx = np.linspace(0, len(gens) - 1, max_gens).astype(int)
-        gens = [gens[i] for i in idx]
-    fig, ax = plt.subplots(figsize=(8, 6))
-    colors = plt.cm.plasma(np.linspace(0, 0.9, len(gens)))
-    for c, gen in zip(colors, gens):
-        gdf = df[pd.to_numeric(df[COL_GENERATION], errors="coerce") == gen]
-        sub = gdf[[COL_POP_ID, pheno_col]].apply(pd.to_numeric, errors="coerce").dropna()
-        agg = sub.groupby(COL_POP_ID)[pheno_col].mean().reset_index()
-        ax.plot(agg[COL_POP_ID], agg[pheno_col], "-o", ms=3, color=c, label=f"gen {int(gen)}")
-    ax.set_xlabel("pop_id (spatial position)")
-    ax.set_ylabel(pheno_col)
-    ax.set_title(title)
-    ax.legend(fontsize=8, ncol=2)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def plot_slope_by_generation(slope_df: pd.DataFrame, out_path: Path) -> None:
-    """Mean slope vs generation per regime -- checks temporal stability."""
-    fig, ax = plt.subplots(figsize=(9, 6))
-    regimes = [r for r in sorted(slope_df["regime"].unique(), key=_regime_sort_key)]
-    colors = plt.cm.viridis(np.linspace(0.15, 0.85, len(regimes)))
-    for reg, c in zip(regimes, colors):
-        sub = slope_df[slope_df["regime"] == reg]
-        agg = sub.groupby("generation")["slope"].mean().reset_index()
-        ax.plot(agg["generation"], agg["slope"], "-o", color=c, label=reg)
-    ax.axhline(0, color="0.5", lw=1, ls="--")
-    ax.set_xlabel("Generation")
-    ax.set_ylabel("Mean slope across columns/files")
-    ax.set_title("Mean slope over time by migration regime")
-    ax.legend(title="Regime")
+    ax.set_ylabel("phenotype frequency")
+    ax.set_title(f"{regime} - {cls} ({EPISTASIS_LABELS.get(cls, cls)})")
+    ax.legend(fontsize=8, ncol=2, loc="lower right")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -467,9 +412,8 @@ def run(config: ClineConfig) -> None:
 
     all_slopes: List[pd.DataFrame] = []
     all_validation: List[Dict] = []
-    # Keep one loaded df per regime for the representative plots.
-    example_df: Dict[str, pd.DataFrame] = {}
-    example_repcols: Dict[str, Dict[str, str]] = {}
+    # Tidy phenotype values pooled across files, for the per-(regime x class) plots.
+    all_long: List[pd.DataFrame] = []
 
     for regime, folder in config.regimes.items():
         try:
@@ -503,10 +447,16 @@ def run(config: ClineConfig) -> None:
             if not sdf.empty:
                 all_slopes.append(sdf)
 
-            # Stash the first file of each regime for example plots.
-            if regime not in example_df:
-                example_df[regime] = df
-                example_repcols[regime] = rep
+            # Pool tidy phenotype values (regime, class, column, pop_id, value)
+            # across every selected file for the per-(regime x class) cline plots.
+            if COL_POP_ID in df.columns and cols:
+                melt = df[[COL_POP_ID] + cols].copy()
+                melt[COL_POP_ID] = pd.to_numeric(melt[COL_POP_ID], errors="coerce")
+                melt = melt.melt(id_vars=[COL_POP_ID], var_name="column", value_name="value")
+                melt["value"] = pd.to_numeric(melt["value"], errors="coerce")
+                melt["regime"] = regime
+                melt["epistasis_class"] = melt["column"].map(classify_epistasis_column)
+                all_long.append(melt.dropna(subset=[COL_POP_ID, "value", "epistasis_class"]))
 
     # ---- Assemble master tables ----
     validation_df = pd.DataFrame(all_validation)
@@ -538,35 +488,25 @@ def run(config: ClineConfig) -> None:
     class_summary["epistasis_label"] = class_summary["epistasis_class"].map(EPISTASIS_LABELS)
     class_summary.to_csv(dirs["summaries"] / "summary_by_regime_class_labeled.csv", index=False)
 
-    # ---- Figures ----
+    # ---- Figures: one per (migration regime x epistasis class) ----
+    # 3 regimes x 7 classes = 21 figures, each pooling the 10 selected files,
+    # showing phenotype vs pop_id with the fitted clinal slope.
     figs = dirs["figures"]
-    plot_slope_by_regime(slope_df, figs / "slope_distribution_by_regime.png")
-    plot_slope_by_class(slope_df, figs / "slope_distribution_by_class.png")
-    plot_slope_by_generation(slope_df, figs / "mean_slope_over_generation.png")
-    print(f"[write] figures -> {figs}")
-
-    for regime, df in example_df.items():
-        rep = example_repcols[regime]
-        # one representative column per class for the example plots
-        for cls, col in rep.items():
-            safe = re.sub(r"[^A-Za-z0-9._-]", "_", regime)
-            plot_mean_phenotype_vs_popid(
-                df,
-                col,
-                f"{regime}: mean {col} vs pop_id ({EPISTASIS_LABELS.get(cls, cls)})",
-                figs / f"meanpheno_{safe}_{cls}_{col}.png",
-            )
-        # line plots for a single representative class (first available)
-        if rep:
-            first_cls = sorted(rep.keys())[0]
-            col = rep[first_cls]
-            safe = re.sub(r"[^A-Za-z0-9._-]", "_", regime)
-            plot_lines_by_generation(
-                df,
-                col,
-                f"{regime}: {col} vs pop_id across generations",
-                figs / f"lines_{safe}_{first_cls}_{col}.png",
-            )
+    long_df = pd.concat(all_long, ignore_index=True) if all_long else pd.DataFrame()
+    n_written = 0
+    if not long_df.empty:
+        regimes = sorted(long_df["regime"].unique(), key=_regime_sort_key)
+        for regime in regimes:
+            reg_dir = figs / re.sub(r"[^A-Za-z0-9._-]", "_", regime)
+            reg_dir.mkdir(parents=True, exist_ok=True)
+            for cls in EPISTASIS_PREFIXES:
+                cell = long_df[(long_df["regime"] == regime) & (long_df["epistasis_class"] == cls)]
+                if cell.empty:
+                    continue
+                safe = re.sub(r"[^A-Za-z0-9._-]", "_", regime)
+                plot_class_cline(regime, cls, cell, reg_dir / f"cline_{safe}_{cls}.png")
+                n_written += 1
+    print(f"[write] {n_written} figure(s) -> {figs} (grouped by regime, one per epistasis class)")
 
     print("\n[done] Outputs written under:", config.out_dir.resolve())
     _print_headline(slope_df, class_summary)
